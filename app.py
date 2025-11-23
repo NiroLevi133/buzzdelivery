@@ -5,361 +5,238 @@ from services import (
     send_whatsapp_message,
     load_data,
     save_data,
-    save_allowed_numbers,
     calculate_time_range,
-    load_conversations,
-    clear_conversation
+    normalize_phone
 )
+import uuid 
+import os 
 
-# RTL CSS
+# עיצוב RTL והתאמות לטבלה
 st.markdown("""
 <style>
-body, html, .stTextInput, .stButton, .stDataFrame, .css-18e3th9, .css-1d391kg {
+body, html, .stTextInput, .stButton, .stDataFrame, .stTextArea, div[data-testid="stTable"], .stNumberInput {
     direction: rtl;
     text-align: right;
 }
-.full-status { background-color: #d4edda; color: #155724; padding: 5px; border-radius: 5px; font-weight: bold; }
-.partial-status { background-color: #fff3cd; color: #856404; padding: 5px; border-radius: 5px; font-weight: bold; }
-.missing-status { background-color: #f8d7da; color: #721c24; padding: 5px; border-radius: 5px; font-weight: bold; }
-.chat-message { padding: 10px; margin: 5px; border-radius: 10px; max-width: 80%; }
-.user-message { background-color: #e3f2fd; margin-left: auto; text-align: right; }
-.bot-message { background-color: #f5f5f5; margin-right: auto; text-align: left; }
+/* עיצוב כותרות הטבלה */
+th {
+    text-align: right !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
+# --- אתחול נתונים חכם (תיקון השגיאה) ---
+if "all_batches" not in st.session_state:
+    data = load_data()
+    # בדיקה קריטית: אם הנתונים הם רשימה (גרסה ישנה), נאפס למילון
+    if isinstance(data, list):
+        st.session_state["all_batches"] = {}
+    else:
+        st.session_state["all_batches"] = data
 
-# מערכת נתונים בזיכרון
-if "deliveries" not in st.session_state:
-    st.session_state["deliveries"] = load_data()
+# הגנה נוספת: ודא שזה מילון בכל מקרה
+if not isinstance(st.session_state["all_batches"], dict):
+    st.session_state["all_batches"] = {}
 
+# אתחול רשימה זמנית לבניית המסלול (אם לא קיימת)
+if "temp_route_list" not in st.session_state:
+    st.session_state["temp_route_list"] = []
 
-st.sidebar.title("🚛 תפריט Buzz AI")
-page = st.sidebar.selectbox("בחר מסך:", [
-    "העלאת קובץ", 
-    "שליחת הודעות פתיחה", 
-    "דשבורד משלוחים",
-    "צפייה בשיחות"
-])
-
+st.sidebar.title("🚛 Buzz Lite")
+page = st.sidebar.selectbox("בחר פעולה:", ["בניית מסלול (הזנה)", "המסלול שלי (צפייה)"])
 
 # ============================================================
-# 1) העלאת קובץ
+# 1) בניית מסלול (הזנה דינמית)
 # ============================================================
-if page == "העלאת קובץ":
-    st.title("📦 העלאת קובץ משלוחים חדש")
+if page == "בניית מסלול (הזנה)":
+    st.title("📝 בניית מסלול הפצה")
+    st.info("הוסף את המשלוחים אחד-אחד. בסיום, לחץ על 'שלח הודעות לכולם'.")
     
-    st.info("""
-    **פורמט הקובץ הנדרש:**
-    - עמודות חובה: `ID`, `recipient_name`, `recipient_phone`, `city`, `street`
-    - עמודות אופציונליות: `apartment`, `floor`, `entrance_code`
-    """)
-    
-    file = st.file_uploader("העלה קובץ Excel (פורמט XLSX)", type=["xlsx"])
-    
-    if file:
-        df = pd.read_excel(file)
-        st.subheader("נתוני קובץ:")
-        st.dataframe(df)
+    # זיהוי שליח (נשמר ב-Session כדי לא להקליד כל רגע)
+    if "dispatcher_phone" not in st.session_state:
+        st.session_state["dispatcher_phone"] = ""
         
-        # מיפוי אפשרויות שמות עמודות
-        col_mapping = {
-            "ID": ["ID", "id", "מזהה"],
-            "recipient_name": ["recipient_name", "name", "שם", "שם לקוח"],
-            "recipient_phone": ["recipient_phone", "phone", "טלפון", "מספר טלפון"],
-            "city": ["city", "עיר"],
-            "street": ["street", "רחוב", "כתובת"]
-        }
+    dispatcher_phone = st.text_input("מספר הטלפון שלך (השליח):", 
+                                     value=st.session_state["dispatcher_phone"],
+                                     placeholder="05X-XXXXXXX").strip()
+    st.session_state["dispatcher_phone"] = dispatcher_phone # שמירה
+
+    st.markdown("---")
+
+    # --- חישוב המספר הסידורי הבא ---
+    # ברירת המחדל: המספר הגבוה ביותר ברשימה + 1, או 1 אם הרשימה ריקה
+    current_list = st.session_state["temp_route_list"]
+    if current_list:
+        next_seq = max([item['seq'] for item in current_list]) + 1
+    else:
+        next_seq = 1
+
+    # --- טופס הוספת משלוח (שורה אחת) ---
+    with st.form(key="add_delivery_form", clear_on_submit=True):
+        c1, c2, c3 = st.columns([1, 2, 2])
         
-        normalized_df = df.copy()
-        for standard_name, possible_names in col_mapping.items():
-            for possible in possible_names:
-                if possible in df.columns:
-                    normalized_df.rename(columns={possible: standard_name}, inplace=True)
-                    break
-        
-        required_cols = ["ID", "recipient_name", "recipient_phone", "city", "street"]
-        missing_cols = [col for col in required_cols if col not in normalized_df.columns]
-        
-        if missing_cols:
-            st.error(f"❌ חסרות עמודות חובה: {', '.join(missing_cols)}")
+        with c1:
+            # השליח יכול לשנות את המספר ידנית אם יש כפילות
+            seq_input = st.number_input("מס' סידורי", min_value=1, value=next_seq, step=1)
+        with c2:
+            name_input = st.text_input("שם הנמען (אופציונלי)")
+        with c3:
+            phone_input = st.text_input("טלפון (חובה)")
+            
+        add_btn = st.form_submit_button("➕ הוסף לרשימה")
+
+    # --- לוגיקה בהוספה ---
+    if add_btn:
+        if not phone_input:
+            st.error("❌ חובה להזין מספר טלפון.")
         else:
-            if st.button("✅ שמור למערכת והכן לשליחה"):
-                data = normalized_df.to_dict(orient="records")
-                
-                for i, d in enumerate(data, start=1):
-                    d["recipient_phone"] = str(d["recipient_phone"]).replace("-", "").replace(" ", "").strip()
-                    d["status"] = "חסר"
-                    d["last_message"] = ""
-                    d["someone_home"] = None
-                    d["estimated_time_range"] = calculate_time_range(i)
-                    d["position"] = i
-                    d["apartment"] = d.get("apartment")
-                    d["floor"] = d.get("floor")
-                    d["entrance_code"] = d.get("entrance_code")
-                
-                st.session_state["deliveries"] = data
-                save_data(data)
-                
-                allowed_numbers = [
-                    str(p).replace("-", "").replace(" ", "").strip() 
-                    for p in normalized_df["recipient_phone"].unique()
-                ]
-                save_allowed_numbers(allowed_numbers)
-                
-                st.success(f"✅ הקובץ נטען בהצלחה! ({len(data)} משלוחים)")
+            # הוספה לרשימה הזמנית בזיכרון
+            new_item = {
+                "seq": seq_input,
+                "name": name_input if name_input else "לקוח",
+                "phone": normalize_phone(phone_input)
+            }
+            st.session_state["temp_route_list"].append(new_item)
+            st.rerun() # ריענון כדי לעדכן את הטבלה ואת המספר הסידורי הבא
 
-
-# ============================================================
-# 2) שליחת הודעות פתיחה
-# ============================================================
-elif page == "שליחת הודעות פתיחה":
-    st.title("📨 שליחת הודעות פתיחה ללקוחות")
-    
-    deliveries = load_data()
-    
-    if not deliveries:
-        st.warning("⚠️ לא נטען עדיין קובץ משלוחים.")
-    else:
-        num_to_send = len(deliveries)
-        st.info(f"מוכן לשליחת הודעה ל-**{num_to_send}** לקוחות.")
+    # --- תצוגת הטבלה שנבנית ---
+    if st.session_state["temp_route_list"]:
+        st.write(f"### 📋 רשימת משלוחים ({len(st.session_state['temp_route_list'])})")
         
-        with st.expander("👀 לחץ לראות דוגמה להודעה שתישלח"):
-            example = deliveries[0] if deliveries else {}
-            example_name = example.get("recipient_name", "ישראל ישראלי")
-            example_time = example.get("estimated_time_range", "10:00-12:30")
-            example_city = example.get("city", "תל אביב")
-            example_street = example.get("street", "דיזנגוף 50")
-            
-            st.markdown(f"""
-```
-היי {example_name}! 👋
-
-יש לך חבילה בדרך מ-Buzz!
-השליח שלנו צפוי להגיע בין השעות {example_time}
-
-📍 הכתובת שלך: {example_street}, {example_city}
-
-האם יהיה מישהו בבית? 🏠
-```
-            """)
+        # המרה ל-DataFrame לתצוגה יפה
+        df = pd.DataFrame(st.session_state["temp_route_list"])
         
-        if st.button(f"🚀 שלח הודעה לכל ה-{num_to_send} לקוחות"):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            success_count = 0
-            fail_count = 0
-            
-            for i, d in enumerate(deliveries):
-                phone = str(d["recipient_phone"])
-                name = d["recipient_name"]
-                time_range = d.get("estimated_time_range", "זמן מיוסך")
-                city = d.get("city", "")
-                street = d.get("street", "")
-                
-                message = f"""היי {name}! 👋
-
-יש לך חבילה בדרך מ-Buzz!
-השליח שלנו צפוי להגיע בין השעות {time_range}
-
-📍 הכתובת שלך: {street}, {city}
-
-האם יהיה מישהו בבית? 🏠"""
-                
-                status_text.text(f"שולח ל-{name} ({i+1}/{num_to_send})...")
-                
-                if send_whatsapp_message(phone, message):
-                    success_count += 1
-                else:
-                    fail_count += 1
-                
-                progress_bar.progress((i + 1) / num_to_send)
-            
-            status_text.empty()
-            st.success(f"""
-            ✅ תהליך השליחה הסתיים!
-            - נשלחו בהצלחה: {success_count}
-            - נכשלו: {fail_count}
-            
-            🤖 הבוט מחכה כעת לתשובות הלקוחות בוואטסאפ
-            """)
-
-
-# ============================================================
-# 3) דשבורד משלוחים
-# ============================================================
-elif page == "דשבורד משלוחים":
-    st.title("🚚 דשבורד Buzz – סטטוס משלוחים")
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.info("הנתונים מתעדכנים אוטומטית כשהלקוח עונה.")
-    with col2:
-        if st.button("🔄 רענן"):
-            st.rerun()
-    
-    deliveries = load_data()
-    
-    if not deliveries:
-        st.warning("⚠️ אין נתוני משלוחים להצגה.")
-    else:
-        # סטטיסטיקות
-        total = len(deliveries)
-        completed = len([d for d in deliveries if d.get("status") == "מלא"])
-        partial = len([d for d in deliveries if d.get("status") == "חלקי"])
-        missing = len([d for d in deliveries if d.get("status") == "חסר"])
-        
-        st.subheader("📊 סטטיסטיקות")
-        cols = st.columns(4)
-        cols[0].metric("סה״כ משלוחים", total)
-        cols[1].metric("✅ מלא", completed)
-        cols[2].metric("⚠️ חלקי", partial)
-        cols[3].metric("❌ חסר", missing)
-        
-        st.markdown("---")
-        
-        # פילטרים
-        st.subheader("🔎 סינון")
-        filter_col1, filter_col2 = st.columns(2)
-        
-        with filter_col1:
-            status_filter = st.multiselect(
-                "סנן לפי סטטוס:",
-                options=["מלא", "חלקי", "חסר"],
-                default=["מלא", "חלקי", "חסר"]
-            )
-        
-        with filter_col2:
-            search_name = st.text_input("חיפוש לפי שם לקוח:")
-        
-        # סינון הנתונים
-        filtered = [d for d in deliveries if d.get("status") in status_filter]
-        
-        if search_name:
-            filtered = [d for d in filtered if search_name.lower() in d.get("recipient_name", "").lower()]
-        
-        if not filtered:
-            st.warning("אין משלוחים התואמים לסינון.")
-        else:
-            # הכנת DataFrame
-            df = pd.DataFrame(filtered)
-            
-            def format_status(status):
-                if status == "מלא":
-                    return "<span class='full-status'>✅ מלא</span>"
-                elif status == "חלקי":
-                    return "<span class='partial-status'>⚠️ חלקי</span>"
-                else:
-                    return "<span class='missing-status'>❌ חסר</span>"
-            
-            df["סטטוס_HTML"] = df["status"].apply(format_status)
-            
-            display_df = df[[
-                "position", "recipient_name", "recipient_phone", 
-                "estimated_time_range", "סטטוס_HTML",
-                "city", "street", "apartment", "floor", "entrance_code"
-            ]].rename(columns={
-                "position": "#",
-                "recipient_name": "שם לקוח",
-                "recipient_phone": "טלפון",
-                "estimated_time_range": "זמן משוער",
-                "סטטוס_HTML": "סטטוס",
-                "city": "עיר",
-                "street": "רחוב",
-                "apartment": "דירה",
-                "floor": "קומה",
-                "entrance_code": "קוד כניסה"
-            })
-            
-            display_df = display_df.sort_values("#")
-            
-            st.markdown(display_df.to_html(escape=False, index=False), unsafe_allow_html=True)
-            
-            st.download_button(
-                label="📥 הורד כ-CSV",
-                data=display_df.to_csv(index=False).encode('utf-8-sig'),
-                file_name=f"buzz_deliveries_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
-
-
-# ============================================================
-# 4) צפייה בשיחות
-# ============================================================
-elif page == "צפייה בשיחות":
-    st.title("💬 צפייה בשיחות עם הלקוחות")
-    
-    deliveries = load_data()
-    conversations = load_conversations()
-    
-    if not deliveries:
-        st.warning("⚠️ אין נתוני משלוחים.")
-    else:
-        # בחירת לקוח
-        customer_options = {
-            f"{d['recipient_name']} ({d['recipient_phone']})": d['recipient_phone']
-            for d in deliveries
-        }
-        
-        selected_customer = st.selectbox(
-            "בחר לקוח לצפייה בשיחה:",
-            options=list(customer_options.keys())
+        # תצוגה בטבלה
+        st.dataframe(
+            df.rename(columns={"seq": "מס'", "name": "שם", "phone": "טלפון"}),
+            use_container_width=True,
+            hide_index=True
         )
         
-        if selected_customer:
-            phone = customer_options[selected_customer]
-            phone_short = phone.lstrip("972").lstrip("0")
-            
-            # מציאת המשלוח
-            delivery = next((d for d in deliveries if phone_short in str(d.get("recipient_phone"))), None)
-            
-            if delivery:
-                st.markdown("---")
+        col_actions1, col_actions2 = st.columns(2)
+        
+        with col_actions1:
+            if st.button("🗑️ נקה רשימה והתחל מחדש"):
+                st.session_state["temp_route_list"] = []
+                st.rerun()
                 
-                # מידע על הלקוח
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader(f"👤 {delivery['recipient_name']}")
-                    st.write(f"📍 {delivery.get('street', '')}, {delivery.get('city', '')}")
-                    st.write(f"⏰ זמן משוער: {delivery.get('estimated_time_range', '')}")
-                
-                with col2:
-                    status = delivery.get("status", "חסר")
-                    if status == "מלא":
-                        st.success("✅ הושלם")
-                    elif status == "חלקי":
-                        st.warning("⚠️ חלקי")
-                    else:
-                        st.error("❌ חסר")
-                
-                st.markdown("---")
-                
-                # הצגת השיחה
-                if phone_short in conversations and conversations[phone_short]:
-                    st.subheader("💬 השיחה:")
-                    
-                    for msg in conversations[phone_short]:
-                        if msg["role"] == "user":
-                            st.markdown(f"""
-                            <div class="chat-message user-message">
-                                <strong>👤 {delivery['recipient_name']}:</strong><br>
-                                {msg['content']}
-                            </div>
-                            """, unsafe_allow_html=True)
-                        elif msg["role"] == "assistant":
-                            st.markdown(f"""
-                            <div class="chat-message bot-message">
-                                <strong>🤖 אלכס (Buzz):</strong><br>
-                                {msg['content']}
-                            </div>
-                            """, unsafe_allow_html=True)
-                    
-                    # כפתור לאיפוס שיחה
-                    if st.button("🔄 אפס שיחה"):
-                        clear_conversation(phone)
-                        st.success("השיחה אופסה!")
-                        st.rerun()
+        with col_actions2:
+            # --- הכפתור הגדול: יצירת המסלול ושליחה ---
+            if st.button("🚀 סיימתי - צור מסלול ושלח הודעות"):
+                if not dispatcher_phone:
+                    st.error("אנא הזן את מספר הטלפון שלך למעלה.")
                 else:
-                    st.info("💭 עדיין אין שיחה עם לקוח זה.")
-            else:
-                st.error("לא נמצא משלוח ללקוח זה.")
+                    # יצירת Batch
+                    batch_id = f"ROUTE-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+                    
+                    new_batch = {
+                        "dispatcher_phone": normalize_phone(dispatcher_phone),
+                        "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        "deliveries": []
+                    }
+                    
+                    progress = st.progress(0)
+                    sent_count = 0
+                    total = len(st.session_state["temp_route_list"])
+                    
+                    for i, item in enumerate(st.session_state["temp_route_list"]):
+                        # חישוב זמן משוער
+                        time_range = calculate_time_range(i + 1)
+                        
+                        delivery = {
+                            "sequence_number": item["seq"],
+                            "recipient_name": item["name"],
+                            "recipient_phone": item["phone"],
+                            "status": "נשלח",
+                            "last_message": "",
+                            "someone_home": None,
+                            "drop_location": None,
+                            "apartment": None,
+                            "floor": None,
+                            "entrance_code": None,
+                            "estimated_time_range": time_range,
+                            "batch_id": batch_id
+                        }
+                        
+                        new_batch["deliveries"].append(delivery)
+                        
+                        # הודעת פתיחה מותאמת
+                        msg_name = f" {item['name']}" if item['name'] != "לקוח" else ""
+                        
+                        msg = f"""היי{msg_name}! 👋 כאן השליח של Buzz.
+יש לי משלוח עבורך שצפוי להגיע בין השעות {time_range}.
+
+כדי שאוכל למסור אותו, אני צריך לדעת:
+❓ האם יהיה מישהו בבית בשעות אלו? (כן / לא)"""
+
+                        send_whatsapp_message(item["phone"], msg)
+                        sent_count += 1
+                        progress.progress((i + 1) / total)
+                    
+                    # שמירה ל-DB
+                    st.session_state["all_batches"][batch_id] = new_batch
+                    save_data(st.session_state["all_batches"])
+                    
+                    # איפוס
+                    st.session_state["temp_route_list"] = []
+                    st.success(f"✅ המסלול נוצר בהצלחה! נשלחו {sent_count} הודעות.")
+                    st.balloons()
+
+# ============================================================
+# 2) המסלול שלי (צפייה וניהול)
+# ============================================================
+elif page == "המסלול שלי (צפייה)":
+    st.title("📋 המסלול שלי")
+    
+    # שימוש בטלפון שנשמר בזיכרון אם קיים
+    default_phone = st.session_state.get("dispatcher_phone", "")
+    search = st.text_input("הכנס טלפון שליח:", value=default_phone, placeholder="05X-XXXXXXX").strip()
+    
+    if search:
+        norm_search = normalize_phone(search)
+        
+        # שימוש ב-session_state כדי למנוע טעינה מחדש מיותרת
+        all_data = st.session_state["all_batches"]
+        my_deliveries = []
+        
+        # איסוף כל המשלוחים (עם הגנה מפני סוגי מידע שגויים)
+        if isinstance(all_data, dict):
+            for bid, bdata in all_data.items():
+                if bdata.get("dispatcher_phone") == norm_search:
+                    my_deliveries.extend(bdata["deliveries"])
+        
+        if not my_deliveries:
+            st.warning("לא נמצאו משלוחים למספר זה.")
+        else:
+            # המרה ל-DF ומיון
+            df = pd.DataFrame(my_deliveries)
+            
+            # מיון לפי ה-Batch ID (שהוא זמן) ואז לפי המספר הסידורי
+            df = df.sort_values(by=["batch_id", "sequence_number"], ascending=[False, True])
+            
+            st.subheader(f"סה״כ משלוחים פעילים: {len(df)}")
+
+            # תצוגה נקייה לשליח
+            df_show = df[[
+                "sequence_number", "recipient_name", "recipient_phone", "someone_home", 
+                "drop_location", "floor", "apartment", "entrance_code", "status"
+            ]].rename(columns={
+                "sequence_number": "מס'",
+                "recipient_name": "שם",
+                "recipient_phone": "טלפון",
+                "someone_home": "בבית?",
+                "drop_location": "איפה להשאיר",
+                "floor": "קומה",
+                "apartment": "דירה",
+                "entrance_code": "קוד",
+                "status": "סטטוס"
+            })
+            
+            # שימוש ב-dataframe אינטראקטיבי
+            st.dataframe(df_show, hide_index=True)
+            
+            st.info("💡 הנתונים מתעדכנים בזמן אמת כשהלקוחות עונים בוואטסאפ.")
+            
+            if st.button("🔄 רענן נתונים"):
+                st.session_state["all_batches"] = load_data()
+                st.rerun()
